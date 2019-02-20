@@ -1,39 +1,16 @@
 /**
- *  Zooz Power Switch v2.0
- *  (Models: ZEN15)
+ *  Zooz Smart Plug v2.0
+ *  (Models: ZEN06)
  *
  *  Author: 
  *    Kevin LaFramboise (krlaframboise)
  *
- *  URL to documentation: https://community.smartthings.com/t/release-zooz-power-switch-zooz-smart-plug/97220?u=krlaframboise
+ *  URL to documentation: 
  *    
  *
  *  Changelog:
  *
- *    2.0 (02/10/2019)
- *      - Added support for firmware version 2.0 config parameters.
- *      - Log warnings when settings selected that don't match firmware.
- *      - Added longer delay between commands to prevent duplicate events and improve reliability of setting syncing.
- *			- Added debug logging for capability commands.
- *      - Added Light capability for new mobile app support.
- *
- *    1.6 (01/26/2019)
- *      - Stopped forcing isStateChange to true which will prevent duplicate events.
- *
- *    1.5 (07/30/2018)
- *      - Added support for new mobile app.
- *
- *    1.4 (12/17/2017)
- *      - Added Acceleration capability for detecting when power is on or off and setting for the active threshold.
- *      - Added overload protection override setting.
- *
- *    1.2 (09/09/2017)
- *      - The device seems to occasionallly report values that are way above a realitic value for some users so add a check that logs the value as a warning instead of creating events for it.
- *
- *    1.1 (09/06/2017)
- *      - Switched history to value tile to fix iOS bug.
- *
- *    1.0 (07/26/2017)
+ *    2.0 (12/02/2018)
  *      - Initial Release
  *
  *
@@ -49,7 +26,7 @@
  */
 metadata {
 	definition (
-		name: "Zooz Power Switch", 
+		name: "Zooz Smart Plug", 
 		namespace: "krlaframboise", 
 		author: "Kevin LaFramboise",
 		vid:"generic-switch-power-energy"
@@ -72,7 +49,6 @@ metadata {
 		attribute "energyTime", "number"
 		attribute "energyCost", "string"
 		attribute "energyDuration", "string"
-		attribute "firmwareVersion", "string"		
 		
 		["power", "voltage", "current"].each {
 			attribute "${it}Low", "number"
@@ -81,9 +57,7 @@ metadata {
 				
 		command "reset"
 
-		fingerprint mfr:"027A", prod:"0101", model:"000D", deviceJoinName: "Zooz Power Switch" // VER 1.0 & 2.0
-		
-		fingerprint mfr:"027A", prod:"0101", model:"000A", deviceJoinName: "Zooz Smart Plug" // VER 1.0
+		fingerprint mfr:"027A", prod:"0101", model:"000A", deviceJoinName: "Zooz Smart Plug"
 	}
 
 	simulator { }
@@ -144,11 +118,8 @@ metadata {
 		valueTile("history", "device.history", decoration:"flat",width: 6, height: 3) {
 			state "history", label:'${currentValue}'
 		}
-		valueTile("firmwareVersion", "device.firmwareVersion", decoration:"flat", width:3, height: 1) {
-			state "firmwareVersion", label:'Firmware ${currentValue}'
-		}
 		main "switch"
-		details(["switch", "power", "energy", "refresh", "voltage", "current", "reset", "history", "firmwareVersion"])
+		details(["switch", "power", "energy", "refresh", "voltage", "current", "reset", "history"])
 	}
 }
 
@@ -193,17 +164,9 @@ private getMeterMap(name, scale, unit, limit, displayed) {
 }
 
 
-def installed() {
-	logDebug "installed()..."
-	return reset()
-}
-
-
 def updated() {	
 	if (!isDuplicateCommand(state.lastUpdated, 3000)) {
 		state.lastUpdated = new Date().time
-		
-		logDebug "updated()..."
 		
 		def cmds = configure()
 		return cmds ? response(cmds) : []
@@ -211,28 +174,20 @@ def updated() {
 }
 
 def configure() {
-	logDebug "configure()..."
 	def result = []
 	
 	updateHealthCheckInterval()
 		
 	def cmds = []	
-	
-	if (!device.currentValue("firmwareVersion")) {
-		cmds << versionGetCmd()
+	configParams.each { param ->	
+		cmds += updateConfigVal(param)
 	}
-	
-	configParams.each { param ->		
-		cmds += updateConfigVal(param)		
-	}
-	result += cmds ? delayBetween(cmds, 1000) : []
+	result += delayBetweenCmds(cmds)
 	
 	if (!getAttrVal("energyTime")) {
-		result << "delay 1000"
 		result += reset()
 	}
-	else if (!state.configured) {
-		result << "delay 1000"
+	else {
 		result += refresh()	
 	}	
 	return result
@@ -242,7 +197,7 @@ private updateConfigVal(param) {
 	def cmds = []	
 	if (hasPendingChange(param)) {
 		def newVal = getParamIntVal(param)
-		logDebug "${param.name}(#${param.num}): changing ${getParamStoredIntVal(param)} to ${newVal}"
+		logTrace "${param.name}(#${param.num}): changing ${getParamStoredIntVal(param)} to ${newVal}"
 		cmds << configSetCmd(param, newVal)
 		cmds << configGetCmd(param)
 	}	
@@ -250,15 +205,7 @@ private updateConfigVal(param) {
 }
 
 private hasPendingChange(param) {
-	if (param.num != manualControlParam.num || isFirmwareVersion2()) {
-		return (getParamIntVal(param) != getParamStoredIntVal(param))
-	}
-	else {
-		if (getParamIntVal(param) == 0) {
-			logNotSupportedMessage("Manual Control option 'Disabled'", "")
-		}
-		return false
-	}
+	return (getParamIntVal(param) != getParamStoredIntVal(param))
 }
 
 void updateHealthCheckInterval() {
@@ -277,55 +224,49 @@ void updateHealthCheckInterval() {
 	}
 }
 
-
 def ping() {
-	logDebug "ping()..."
-	sendHubCommand([
-		new physicalgraph.device.HubAction(switchBinaryGetCmd())
-	], 100)
-	return []
+	logDebug "Pinging device because it has not checked in"
+	return [switchBinaryGetCmd()]
 }
 
 
 def on() {
-	logDebug "on()..."
-	return delayBetween([
+	logTrace "Turning On"
+	return delayBetweenCmds([
 		switchBinarySetCmd(0xFF),
 		switchBinaryGetCmd()
-	], 500)
+	])
 }
 
 def off() {
-	logDebug "off()..."
-	return delayBetween([
+	logTrace "Turning Off"
+	return delayBetweenCmds([
 		switchBinarySetCmd(0x00),
 		switchBinaryGetCmd()
-	], 500)
+	])
 }
 
 def refresh() {
-	logDebug "refresh()..."
-	return delayBetween([
+	logTrace "Refreshing"
+	return delayBetweenCmds([
 		switchBinaryGetCmd(),
 		meterGetCmd(meterEnergy),
 		meterGetCmd(meterPower),
 		meterGetCmd(meterVoltage),
 		meterGetCmd(meterCurrent)
-	], 1000)
+	])
 }
 
 def reset() {
-	logDebug "reset()..."
+	logTrace "Resetting"
 	["power", "voltage", "current"].each {
 		sendEvent(createEventMap("${it}Low", getAttrVal(it), false))
 		sendEvent(createEventMap("${it}High", getAttrVal(it), false))
 	}
 	sendEvent(createEventMap("energyTime", new Date().time, false))
 	
-	def result = [
-		meterResetCmd(),
-		"delay 1000"
-	]
+	def result = []
+	result << meterResetCmd()
 	result += refresh()
 	return result
 }
@@ -337,10 +278,6 @@ private meterGetCmd(meter) {
 
 private meterResetCmd() {
 	return secureCmd(zwave.meterV3.meterReset())
-}
-
-private versionGetCmd() {
-	return secureCmd(zwave.versionV1.versionGet())
 }
 
 private switchBinaryGetCmd() {
@@ -368,6 +305,10 @@ private secureCmd(cmd) {
 	}	
 }
 
+private delayBetweenCmds(cmds, delay=500) {
+	return cmds ? delayBetween(cmds, delay) : []
+}
+
 
 def parse(String description) {	
 	def result = []
@@ -381,7 +322,7 @@ def parse(String description) {
 		
 	if (!isDuplicateCommand(state.lastCheckinTime, 60000)) {
 		state.lastCheckinTime = new Date().time
-		sendEvent(name: "lastCheckin", value: convertToLocalTimeString(new Date()), displayed: false, isStateChange: true)
+		result << createEvent(createEventMap("lastCheckin", convertToLocalTimeString(new Date()), false))
 	}
 	return result
 }
@@ -422,21 +363,13 @@ private getCommandClassVersions() {
 
 def zwaveEvent(physicalgraph.zwave.commands.configurationv2.ConfigurationReport cmd) {	
 	def val = cmd.scaledConfigurationValue
-	
-	state.configured = true
-	
+		
 	def configParam = configParams.find { param ->
 		param.num == cmd.parameterNumber
 	}
 	
 	if (configParam) {
-		def nameVal = val
-		// Led config parameters have different values based on firmware.
-		if (configParam.num == ledIndicatorParam.num && !isFirmwareVersion2() && val == 1) {
-			nameVal = 2
-		}
-		
-		def name = configParam.options?.find { it.value == nameVal}?.key
+		def name = configParam.options?.find { it.value == val}?.key
 		logDebug "${configParam.name}(#${configParam.num}) = ${name != null ? name : val} (${val})"
 		state["configVal${cmd.parameterNumber}"] = val
 		
@@ -449,18 +382,6 @@ def zwaveEvent(physicalgraph.zwave.commands.configurationv2.ConfigurationReport 
 		logDebug "Parameter ${cmd.parameterNumber} = ${val}"
 	}	
 	return []
-}
-
-def zwaveEvent(physicalgraph.zwave.commands.versionv1.VersionReport cmd) {
-	logTrace "VersionReport: ${cmd}"
-	
-	def version = "${cmd.applicationVersion}.${cmd.applicationSubVersion}"
-	
-	if (version != device.currentValue("firmwareVersion")) {
-		logDebug "Firmware: ${version}"
-		sendEvent(name: "firmwareVersion", value: version, displayed:false)
-	}
-	return []	
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.switchbinaryv1.SwitchBinaryReport cmd) {
@@ -653,12 +574,13 @@ private getOnOffNotificationsParam() {
 }
 
 private getLedIndicatorParam() {
-	return createConfigParamMap(27, "LED Power Consumption Indicator", 1, ["Always Show${defaultOptionSuffix}":0, "Show when On (FIRMWARE 2.0)":1, "Show for 5 seconds when turned on or off":2, "Always Off (FIRMWARE 2.0)":3], "ledIndicator")
+	return createConfigParamMap(27, "LED Power Consumption Indicator", 1, ["Always Show":0, "Show when On${defaultOptionSuffix}":1, "Show for 5 seconds when turned on or off":2, "Always Off":3], "ledIndicator")
 }
 
 private getManualControlParam() {
-	return createConfigParamMap(30, "Manual Control (FIRMWARE 2.0)", 1, ["Disabled":0, "Enabled${defaultOptionSuffix}":1], "manualControl")
+	return createConfigParamMap(30, "Manual Control", 1, ["Disabled":0, "Enabled${defaultOptionSuffix}":1], "manualControl")
 }
+
 
 private getPowerValueChangeParam() {
 	return createConfigParamMap(151, "Power Report Value Change", 2, getPowerValueOptions(), "powerValueChange")
@@ -689,36 +611,7 @@ private getParamStoredIntVal(param) {
 }
 
 private getParamIntVal(param) {
-	def val = param.options ? convertOptionSettingToInt(param.options, param.val) : param.val
-	
-	if (param.num == ledIndicatorParam.num) {
-		val = getLedSettingSupportedByFirmware(val)
-	}
-	return val
-}
-
-private getLedSettingSupportedByFirmware(val) {
-	if (!isFirmwareVersion2()) {
-		switch (val) {
-			case 1:
-				logNotSupportedMessage("LED Power Consumption option 'Show When On'", "so using 'Always Show' instead")
-				val = 0
-				break
-			case 2:
-				val = 1
-				break
-			case 3:
-				logNotSupportedMessage("LED Power Consumption option 'Always Off'", "so using 'Always Show'")
-				val = 0
-				break
-		}
-	}
-	return val
-}
-
-private logNotSupportedMessage(prefix, suffix) {
-	def firmware = device.currentValue("firmwareVersion")
-	log.warn "${prefix} is not supported by firmware ${firmware} ${suffix}"
+	return param.options ? convertOptionSettingToInt(param.options, param.val) : param.val
 }
 
 private createConfigParamMap(num, name, size, options, prefName, val=null) {
@@ -849,8 +742,8 @@ private createEventMap(name, value, displayed=null, desc=null, unit=null) {
 	def eventMap = [
 		name: name,
 		value: value,
-		// isStateChange: true,
-		displayed: (displayed == null ? ("${getAttrVal(name)}" != "${value}") : displayed)
+		displayed: (displayed == null ? ("${getAttrVal(name)}" != "${value}") : displayed),
+		isStateChange: true
 	]
 	
 	if (unit) {
@@ -902,10 +795,6 @@ private convertToLocalTimeString(dt) {
 
 private isDuplicateCommand(lastExecuted, allowedMil) {
 	!lastExecuted ? false : (lastExecuted + allowedMil > new Date().time) 
-}
-
-private isFirmwareVersion2() {
-	return safeToDec(device.currentValue("firmwareVersion")) >= 1.3
 }
 
 private logDebug(msg) {
