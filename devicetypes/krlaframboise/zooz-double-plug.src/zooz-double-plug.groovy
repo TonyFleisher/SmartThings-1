@@ -1,5 +1,5 @@
 /**
- *  Zooz Double Plug v1.2.2
+ *  Zooz Double Plug v1.2.5
  *  (Models: ZEN25)
  *
  *  Author: 
@@ -8,6 +8,15 @@
  *	Documentation:
  *
  *  Changelog:
+ *
+ *    1.2.5 (08/16/2020)
+ *      - Removed componentLabel and componentName from child outlet devices which fixes the timeout issue in the new mobile app.
+ *
+ *    1.2.4 (08/10/2020)
+ *      - Added ST workaround for S2 Supervision bug with MultiChannel Devices.
+ *
+ *    1.2.3 (03/14/2020)
+ *      - Fixed bug with enum settings that was caused by a change ST made in the new mobile app.
  *
  *    1.2.2 (02/03/2019)
  *      - Fixed unit on Power Threshold setting.
@@ -260,9 +269,7 @@ private addChildOutlet(dni, endPoint) {
 		[
 			completedSetup: true,
 			isComponent: false,
-			label: "${device.displayName}-${name}",
-			componentLabel: "${name}",
-			componentName: "${name}"
+			label: "${device.displayName}-${name}"
 		]
 	)
 }
@@ -610,7 +617,17 @@ def zwaveEvent(physicalgraph.zwave.commands.securityv1.SecurityMessageEncapsulat
 
 
 def zwaveEvent(physicalgraph.zwave.commands.multichannelv3.MultiChannelCmdEncap cmd) {
-	def encapsulatedCommand = cmd.encapsulatedCommand([0x31: 3])
+	// Workaround that was added to all SmartThings Multichannel DTHs.
+	if (cmd.commandClass == 0x6C && cmd.parameter.size >= 4) { // Supervision encapsulated Message
+		// Supervision header is 4 bytes long, two bytes dropped here are the latter two bytes of the supervision header
+		cmd.parameter = cmd.parameter.drop(2)
+		// Updated Command Class/Command now with the remaining bytes
+		cmd.commandClass = cmd.parameter[0]
+		cmd.command = cmd.parameter[1]
+		cmd.parameter = cmd.parameter.drop(2)
+	}
+	
+	def encapsulatedCommand = cmd.encapsulatedCommand(commandClassVersions)
 	
 	if (encapsulatedCommand) {
 		return zwaveEvent(encapsulatedCommand, cmd.sourceEndPoint)
@@ -950,7 +967,7 @@ private getParam(num, name, size, defaultVal, options=null) {
 }
 
 private setDefaultOption(options, defaultVal) {
-	return options?.collect { k, v ->
+	return options?.collectEntries { k, v ->
 		if ("${k}" == "${defaultVal}") {
 			v = "${v} [DEFAULT]"		
 		}
@@ -969,7 +986,7 @@ private getOverloadOptions() {
 
 private getPowerReportingThresholdOptions() {
 	def options = [0:"Disabled"]
-	[1,2,3,4,5,10,25,50,75,100,150,200,250,300,400,500,750,1000,1250,1500,1750,2000,2500,3000,3500,4000,4500,5000,6000,7000,8000,9000,10000,12500,15000].each {
+	[1,2,3,4,5,10,25,50,75,100,150,200,250,300,400,500,750,1000,1250,1500,1750,2000,2500,3000,3500,4000,4500,5000].each {
 		options["${it}"] = "${it} W"
 	}
 	return options

@@ -1,5 +1,5 @@
 /**
- *  Zooz MultiRelay v1.0
+ *  Zooz MultiRelay v1.3
  *  (Models: ZEN16)
  *
  *  Author:
@@ -9,25 +9,76 @@
  *
  *  Changelog:
  *
+ *    1.3 (09/02/2020)
+ *      - Added support for firmware 1.03
+ *
+ *    1.2.1 (08/10/2020)
+ *      - Added ST workaround for S2 Supervision bug with MultiChannel Devices.
+ *
+ *    1.2 (04/15/2020)
+ *      - Added support for firmware 1.02
+ *      - Fixed default parameters for new mobile app.
+ *      - Changed new mobile app icon to switch
+ *
+ *    1.1.2 (04/10/2020)
+ *      - Fixed time out issue in new mobile app, but to apply the fix you need to manually delete the child devices and then save the settings of the parent so that it re-creates them.
+ *
+ *    1.1.1 (03/13/2020)
+ *      - Fixed bug with enum settings that was caused by a change ST made in the new mobile app.
+ *
+ *    1.1 (02/06/2020)
+ *      - Added Auto On/Off Unit Setting for Relay (FIRMWARE >= 1.01)
+ *      - Changed Auto On/off settings from enum to range because the unit is no longer fixed.
+ *      - Create child devices with built-in Child Switch DTH only if the custom Child Switch DTH isn't installed.
+ *      - Removed "Create Child Switch for ..." options so now a switch for each Relay will always be created.  Zooz wanted the child devices created by default, but the new mobile app has a bug with default values that would result in the child devices getting deleted every time the settings screen is opened.
+ *
  *    1.0 (12/19/2019)
  *      - Initial Release
  *
  *
- *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- *  in compliance with the License. You may obtain a copy of the License at:
- *
+ *  Copyright 2020 Kevin LaFramboise (@krlaframboise)
+ *  
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  
  *      http://www.apache.org/licenses/LICENSE-2.0
+ *  
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
  *
- *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
- *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
- *  for the specific language governing permissions and limitations under the License.
- *
- */
+*/
+import groovy.transform.Field
+
+@Field static Map commandClassVersions = [
+	0x20: 1,	// Basic
+	0x25: 1,	// Switch Binary
+	0x55: 1,	// Transport Service
+	0x59: 1,	// AssociationGrpInfo
+	0x5A: 1,	// DeviceResetLocally
+	0x5E: 2,	// ZwaveplusInfo
+	0x60: 3,	// Multi Channel
+	0x6C: 1,	// Supervision
+	0x70: 2,	// Configuration
+	0x72: 2,	// ManufacturerSpecific
+	0x73: 1,	// Powerlevel
+	0x7A: 2,	// Firmware Update Md
+	0x85: 2,	// Association
+	0x86: 1,	// Version
+	0x8E: 2,	// Multi Channel Association
+	0x98: 1,	// Security 0
+	0x9F: 1		// Security 2
+]
+ 
 metadata {
 	definition (
 		name: "Zooz MultiRelay",
 		namespace: "krlaframboise",
 		author: "Kevin LaFramboise",
+		ocfDeviceType: "oic.d.switch",
 		vid:"generic-switch"
 	) {
 		capability "Actuator"
@@ -105,34 +156,36 @@ metadata {
 	}
 
 	preferences {
-
-		getBoolInput("createRelay1", "Create Child Switch for Relay 1", false)
-		getBoolInput("createRelay2", "Create Child Switch for Relay 2", false)
-		getBoolInput("createRelay3", "Create Child Switch for Relay 3", false)
-
 		configParams.each {
 			getOptionsInput(it)
 		}
-
-		getBoolInput("debugOutput", "Enable Debug Logging", true)
+		
+		input "debugLogging", "enum",
+			title: "Logging:",
+			required: false,
+			defaultValue: "1",
+			options: ["0":"Disabled", "1":"Enabled [DEFAULT]"]					
 	}
 }
 
 
 private getOptionsInput(param) {
-	input "configParam${param.num}", "enum",
-		title: "${param.name}:",
-		required: false,
-		defaultValue: "${param.value}",
-		displayDuringSetup: true,
-		options: param.options
-}
-
-private getBoolInput(name, title, defaultVal) {
-	input "${name}", "bool",
-		title: "${title}?",
-		defaultValue: defaultVal,
-		required: false
+	if (param.options) {
+		input "configParam${param.num}", "enum",
+			title: "${param.name}:",
+			required: false,
+			defaultValue: param.value?.toString(),
+			displayDuringSetup: true,
+			options: param.options
+	}
+	else if (param.range) {
+		input "configParam${param.num}", "number",
+			title: "${param.name}:",
+			required: false,
+			defaultValue: param.value?.toString(),
+			displayDuringSetup: true,
+			range: param.range
+	}
 }
 
 
@@ -148,8 +201,7 @@ def updated() {
 
 		refreshChildSwitches()
 
-		def cmds = getConfigureCmds()
-		return cmds ? response(cmds) : []
+		executeConfigureCmds()
 	}
 }
 
@@ -176,23 +228,22 @@ private initialize() {
 }
 
 private refreshChildSwitches() {
-	if (settings) {
-		(1..3).each {
-			def child = findChildByEndpoint(it)
-			if (child && !settings["createRelay${it}"]) {
-				log.warn "Removing ${child.displayName}} "
-				deleteChildDevice(child.deviceNetworkId)
-				child = null
-			}
-			else if (!child && settings["createRelay${it}"]) {
-				child = addChildSwitch(it)
-				child?.sendEvent(getEventMap("switch", device.currentValue("relay${it}Switch"), false))
-			}
+	(1..3).each {
+		def childEnabled = true // settings ? settings["createRelay${it}"] : true
+		def child = findChildByEndpoint(it)
+		if (child && !childEnabled) {
+			log.warn "Removing ${child.displayName}} "
+			deleteChildDevice(child.deviceNetworkId)
+			child = null
+		}
+		else if (!child && childEnabled) {
+			child = addChildSwitch(it)
+			child?.sendEvent(getEventMap("switch", device.currentValue("relay${it}Switch"), false))
+		}
 
-			def relayName = child ? child.displayName : "Relay ${it}"
-			if (relayName != device.currentValue("relay${it}Name")) {
-				sendEvent(getEventMap("relay${it}Name", relayName, false))
-			}
+		def relayName = child ? child.displayName : "Relay ${it}"
+		if (relayName != device.currentValue("relay${it}Name")) {
+			sendEvent(getEventMap("relay${it}Name", relayName, false))
 		}
 	}
 }
@@ -201,18 +252,16 @@ private addChildSwitch(endpoint) {
 	def name = "Relay ${endpoint}"
 
 	logDebug "Creating Child Switch for ${name}"
-
+	
 	return addChildDevice(
 		"smartthings",
 		"Child Switch",
-		getChildDNI(endpoint),
-		device.getHub().getId(),
+		"${device.deviceNetworkId}:${endpoint}",
+		null,
 		[
 			completedSetup: true,
-			isComponent: false,
 			label: "${device.displayName}-${name}",
-			componentLabel: "${name}",
-			componentName: "${name}",
+			isComponent: false,
 			data: [endpoint: "${endpoint}"]
 		]
 	)
@@ -220,16 +269,25 @@ private addChildSwitch(endpoint) {
 
 
 def configure() {
-	runIn(10, updateSyncStatus)
+	logDebug "configure()..."
 
-	if (!pendingChanges) {
+	if (state.resyncAll == null) {
 		state.resyncAll = true
-	}
 
-	return getConfigureCmds()
+		runIn(4, refresh)
+		runIn(8, executeConfigureCmds)
+	}
+	else {
+		if (!pendingChanges) {
+			state.resyncAll = true
+		}
+		executeConfigureCmds()
+	}
 }
 
-private getConfigureCmds() {
+def executeConfigureCmds() {	
+	runIn(6, updateSyncStatus)
+	
 	def cmds = []
 
 	if (state.resyncAll || !device.currentValue("firmwareVersion")) {
@@ -237,22 +295,27 @@ private getConfigureCmds() {
 	}
 
 	configParams.each {
-		def storedVal = getParamStoredValue(it.num)
-		if (state.resyncAll || "${storedVal}" != "${it.value}") {
-			if (state.configured) {
-				logDebug "CHANGING ${it.name}(#${it.num}) from ${storedVal} to ${it.value}"
-				cmds << configSetCmd(it)
+		if (isParamSupported(it)) {
+			def storedVal = getParamStoredValue(it.num)
+			if (state.resyncAll || "${storedVal}" != "${it.value}") {
+				if (state.configured) {
+					logDebug "CHANGING ${it.name}(#${it.num}) from ${storedVal} to ${it.value}"
+					cmds << configSetCmd(it)
+				}
+				cmds << configGetCmd(it)
 			}
-			cmds << configGetCmd(it)
 		}
 	}
-	return cmds ? delayBetween(cmds, 500) : []
+
+	if (cmds) {
+		sendCommands(delayBetween(cmds, 250))
+	}
 }
 
 
 def ping() {
 	logDebug "ping()..."
-	return sendCommands([ switchBinaryGetCmd() ])
+	return sendCommands([ versionGetCmd() ])
 }
 
 
@@ -297,7 +360,7 @@ def childOff(dni) {
 	executeChildOnOff(0x00, getChildEndpoint(findChildByDNI(dni)))
 }
 
-private executeChildOnOff(value, endpoint) {
+void executeChildOnOff(value, endpoint) {
 	sendCommands([ switchBinarySetCmd(value, endpoint) ])
 }
 
@@ -368,29 +431,6 @@ private secureCmd(cmd) {
 }
 
 
-private getCommandClassVersions() {
-	[
-		0x20: 1,	// Basic
-		0x25: 1,	// Switch Binary
-		0x55: 1,	// Transport Service
-		0x59: 1,	// AssociationGrpInfo
-		0x5A: 1,	// DeviceResetLocally
-		0x5E: 2,	// ZwaveplusInfo
-		0x60: 3,	// Multi Channel
-		0x6C: 1,	// Supervision
-		0x70: 2,	// Configuration
-		0x72: 2,	// ManufacturerSpecific
-		0x73: 1,	// Powerlevel
-		0x7A: 2,	// Firmware Update Md
-		0x85: 2,	// Association
-		0x86: 1,	// Version
-		0x8E: 2,	// Multi Channel Association
-		0x98: 1,	// Security 0
-		0x9F: 1		// Security 2
-	]
-}
-
-
 def parse(String description) {
 	def result = []
 	try {
@@ -431,6 +471,16 @@ def zwaveEvent(physicalgraph.zwave.commands.securityv1.SecurityMessageEncapsulat
 
 
 def zwaveEvent(physicalgraph.zwave.commands.multichannelv3.MultiChannelCmdEncap cmd) {
+	// Workaround that was added to all SmartThings Multichannel DTHs.
+	if (cmd.commandClass == 0x6C && cmd.parameter.size >= 4) { // Supervision encapsulated Message
+		// Supervision header is 4 bytes long, two bytes dropped here are the latter two bytes of the supervision header
+		cmd.parameter = cmd.parameter.drop(2)
+		// Updated Command Class/Command now with the remaining bytes
+		cmd.commandClass = cmd.parameter[0]
+		cmd.command = cmd.parameter[1]
+		cmd.parameter = cmd.parameter.drop(2)
+	}
+	
 	def encapsulatedCommand = cmd.encapsulatedCommand(commandClassVersions)
 
 	if (encapsulatedCommand) {
@@ -494,7 +544,11 @@ private getPendingChanges() {
 }
 
 private isConfigParamSynced(param) {
-	return (param.value == getParamStoredValue(param.num))
+	return (!isParamSupported(param) || param.value == getParamStoredValue(param.num))
+}
+
+private isParamSupported(param) {
+	return (!param.firmware || param.firmware <= firmwareVersion)
 }
 
 private getParamStoredValue(paramNum) {
@@ -507,16 +561,21 @@ private setParamStoredValue(paramNum, value) {
 
 
 def zwaveEvent(physicalgraph.zwave.commands.switchbinaryv1.SwitchBinaryReport cmd, endpoint=0) {
-	logTrace "SwitchBinaryReport: ${cmd}" + (endpoint ? " (Endpoint ${endpoint})" : "")
-	// Using for ping
+	logDebug "SwitchBinaryReport: ${cmd}" + (endpoint ? " (Endpoint ${endpoint})" : "")
+	
+	handleSwitchReport(cmd.value, endpoint)	
 	return []
 }
 
-
 def zwaveEvent(physicalgraph.zwave.commands.basicv1.BasicReport cmd, endpoint=0) {
 	logTrace "BasicReport: ${cmd}" + (endpoint ? " (Endpoint ${endpoint})" : "")
+	
+	handleSwitchReport(cmd.value, endpoint)	
+	return []
+}
 
-	def value = (cmd.value == 0xFF) ? "on" : "off"
+private handleSwitchReport(rawValue, endpoint) {
+	def value = (rawValue == 0xFF) ? "on" : "off"
 
 	if (endpoint) {
 		def child = findChildByEndpoint(endpoint)
@@ -530,8 +589,7 @@ def zwaveEvent(physicalgraph.zwave.commands.basicv1.BasicReport cmd, endpoint=0)
 	}
 	else {
 		sendEvent(getEventMap("switch", value))
-	}
-	return []
+	}	
 }
 
 
@@ -550,14 +608,24 @@ private getConfigParams() {
 		relay3TypeParam,
 		ledIndicatorModeParam,
 		relay1AutoOffParam,
+		relay1AutoOffUnitParam,
 		relay1AutoOnParam,
+		relay1AutoOnUnitParam,
 		relay2AutoOffParam,
+		relay2AutoOffUnitParam,
 		relay2AutoOnParam,
+		relay2AutoOnUnitParam,
 		relay3AutoOffParam,
+		relay3AutoOffUnitParam,
 		relay3AutoOnParam,
+		relay3AutoOnUnitParam,
 		relay1ManualControlParam,
 		relay2ManualControlParam,
-		relay3ManualControlParam
+		relay3ManualControlParam,
+		relay1BehaviorParam,
+		relay2BehaviorParam,
+		relay3BehaviorParam,
+		dcMotorModeParam
 	]
 }
 
@@ -573,20 +641,28 @@ private getPowerFailureRecoveryParam() {
 }
 
 private getRelay1TypeParam() {
-	return getParam(2, "Switch Type for Relay 1", 1, 2, relayTypeOptions)
+	return getRelayTypeParam(2, 1)
 }
-
 private getRelay2TypeParam() {
-	return getParam(3, "Switch Type for Relay 2", 1, 2, relayTypeOptions)
+	return getRelayTypeParam(3, 2)
 }
-
 private getRelay3TypeParam() {
-	return getParam(4, "Switch Type for Relay 3", 1, 2, relayTypeOptions)
+	return getRelayTypeParam(4, 3)
+}
+private getRelayTypeParam(num, relay) {
+	def options = [
+		0:"Momentary Switch",
+		1:"Toggle Switch",
+		2:"Toggle Switch (any change)",
+		3: "Garage Door (FIRMWARE >= 1.02)"
+	]
+	return getParam(num, "Switch Type for Relay ${relay}", 1, 2, options)
 }
 
 private getLedIndicatorModeParam() {
 	def options = [
-		0:"On when ALL Relays are Off", 1:"On when ANY Relay is On",
+		0:"On when ALL Relays are Off", 
+		1:"On when ANY Relay is On",
 		2:"Always Off",
 		3:"Always On"
 	]
@@ -594,89 +670,115 @@ private getLedIndicatorModeParam() {
 }
 
 private getRelay1AutoOffParam() {
-	return getParam(6, "Auto Turn-Off Timer for Relay 1", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(6, "Off", 1)
 }
-
 private getRelay1AutoOnParam() {
-	return getParam(7, "Auto Turn-On Timer for Relay 1", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(7, "On", 1)
 }
-
 private getRelay2AutoOffParam() {
-	return getParam(8, "Auto Turn-Off Timer for Relay 2", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(8, "Off", 2)
 }
-
 private getRelay2AutoOnParam() {
-	return getParam(9, "Auto Turn-On Timer for Relay 2", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(9, "On", 2)
 }
-
 private getRelay3AutoOffParam() {
-	return getParam(10, "Auto Turn-Off Timer for Relay 3", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(10, "Off", 3)
 }
-
 private getRelay3AutoOnParam() {
-	return getParam(11, "Auto Turn-On Timer for Relay 3", 4, 0, autoOnOffOptions)
+	return getAutoOnOffParam(11, "On", 3)
+}
+private getAutoOnOffParam(num, onOff, relay) {
+	return getParam(num, "Auto Turn-${onOff} Timer for Relay ${relay} (0=Disabled, 1-65535)", 4, 0, null, "0..65535")
 }
 
 private getRelay1ManualControlParam() {
-	return getParam(12, "Enable/Disable Manual Control for Relay 1", 1, 1, enabledOptions)
+	return getRelayManualControlParam(12, 1)
 }
-
 private getRelay2ManualControlParam() {
-	return getParam(13, "Enable/Disable Manual Control for Relay 2", 1, 1, enabledOptions)
+	return getRelayManualControlParam(13, 2)
 }
-
 private getRelay3ManualControlParam() {
-	return getParam(14, "Enable/Disable Manual Control for Relay 3", 1, 1, enabledOptions)
+	return getRelayManualControlParam(14, 3)
+}
+private getRelayManualControlParam(num, relay) {
+	return getParam(num, "Enable/Disable Manual Control for Relay ${relay}", 1, 1, [0:"Disabled", 1:"Enabled"])
 }
 
-private getParam(num, name, size, defaultVal, options=null) {
+
+private getRelay1AutoOffUnitParam() {
+	return getAutoOnOffUnitParam(15, "Off", 1)
+}
+private getRelay1AutoOnUnitParam() {
+	return getAutoOnOffUnitParam(16, "On", 1)
+}
+private getRelay2AutoOffUnitParam() {
+	return getAutoOnOffUnitParam(17, "Off", 2)
+}
+private getRelay2AutoOnUnitParam() {
+	return getAutoOnOffUnitParam(18, "On", 2)
+}
+private getRelay3AutoOffUnitParam() {
+	return getAutoOnOffUnitParam(19, "Off", 3)
+}
+private getRelay3AutoOnUnitParam() {
+	return getAutoOnOffUnitParam(20, "On", 3)
+}
+private getAutoOnOffUnitParam(num, onOff, relay) {
+	def options = [
+		0:"Minutes",
+		1:"Seconds (FIRMWARE >= 1.01)",
+		2:"Hours (FIRMWARE >= 1.01)"
+	]
+	return getParam(num, "Auto Turn-${onOff} Timer Unit for Relay ${relay}", 1, 0, options, null, 1.01)
+}
+
+
+private getRelay1BehaviorParam() {
+	return getRelayBehaviorParam(21, 1)
+}
+private getRelay2BehaviorParam() {
+	return getRelayBehaviorParam(22, 2)
+}
+private getRelay3BehaviorParam() {
+	return getRelayBehaviorParam(23, 3)
+}
+private getRelayBehaviorParam(num, relay) {
+	def options = [
+		0:"NO (reports on when switch on)",
+		1:"NC (reports on when switch off)",
+		2:"NC (reports on when switch on)"
+	]
+	return getParam(num, "Relay ${relay} Behavior (FIRMWARE >= 1.03)", 1, 0, options, null, 1.03)
+}
+
+
+private getDcMotorModeParam() {
+	return getParam(24, "DC Motor Mode (FIRMWARE >= 1.03)", 1, 0, [0:"Disabled", 1:"Enabled"], null, 1.03)
+}
+
+
+private getParam(num, name, size, defaultVal, options=null, range=null, firmware=null) {
 	def val = safeToInt((settings ? settings["configParam${num}"] : null), defaultVal)
 
 	def map = [num: num, name: name, size: size, value: val]
 	if (options) {
-		map.valueName = options?.find { k, v -> "${k}" == "${val}" }?.value
 		map.options = setDefaultOption(options, defaultVal)
 	}
+
+	if (range) map.range = range
+
+	if (firmware) map.firmware = firmware
 
 	return map
 }
 
-private setDefaultOption(options, defaultVal) {
-	return options?.collect { k, v ->
-		if ("${k}" == "${defaultVal}") {
-			v = "${v} [DEFAULT]"
+private setDefaultOption(options, defaultVal) {	
+	options?.each {
+		if (it.key == defaultVal) {
+			it.value = "${it.value} [DEFAULT]"
 		}
-		["$k": "$v"]
-	}
-}
-
-
-private getRelayTypeOptions() {
-	return [
-		0:"Momentary Switch",
-		1:"Toggle Switch",
-		2:"Toggle Switch (any change)"
-	]
-}
-
-private getAutoOnOffOptions() {
-	def options = [0:"Disabled"]
-	options = getTimeOptionsRange(options, "Minute", 1, [1,2,3,4,5,6,7,8,9,10,15,20,25,30,45])
-	options = getTimeOptionsRange(options, "Hour", 60, [1,2,3,4,5,6,7,8,9,10,12,18])
-	options = getTimeOptionsRange(options, "Day", (60 * 24), [1,2,3,4,5,6])
-	options = getTimeOptionsRange(options, "Week", (60 * 24 * 7), [1,2])
+	}	
 	return options
-}
-
-private getTimeOptionsRange(options, name, multiplier, range) {
-	range?.each {
-		options["${(it * multiplier)}"] = "${it} ${name}${it == 1 ? '' : 's'}"
-	}
-	return options
-}
-
-private getEnabledOptions() {
-	return [0:"Disabled", 1:"Enabled"]
 }
 
 
@@ -700,6 +802,10 @@ private getEventMap(name, value, displayed=true) {
 }
 
 
+private getFirmwareVersion() {
+	return safeToDec(device.currentValue("firmwareVersion"))
+}
+
 private findChildByEndpoint(endpoint) {
 	return childDevices?.find { getChildEndpoint(it) == endpoint }
 }
@@ -712,13 +818,21 @@ private getChildEndpoint(child) {
 	return child ? safeToInt(child.getDataValue("endpoint")) : 0
 }
 
-private getChildDNI(endpoint) {
-	return "${device.deviceNetworkId}-EP${endpoint}"
-}
-
 
 private safeToInt(val, defaultVal=0) {
-	return "${val}"?.isInteger() ? "${val}".toInteger() : defaultVal
+	if ("${val}"?.isInteger()) {
+		return "${val}".toInteger()
+	}
+	else if ("${val}".isDouble()) {
+		return "${val}".toDouble()?.round()
+	}
+	else {
+		return  defaultVal
+	}
+}
+
+private safeToDec(val, defaultVal=0) {
+	return "${val}"?.isBigDecimal() ? "${val}".toBigDecimal() : defaultVal
 }
 
 private convertToLocalTimeString(dt) {
@@ -735,8 +849,8 @@ private isDuplicateCommand(lastExecuted, allowedMil) {
 	!lastExecuted ? false : (lastExecuted + allowedMil > new Date().time)
 }
 
-private logDebug(msg) {
-	if (settings?.debugOutput != false) {
+void logDebug(msg) {
+	if (safeToInt(settings?.debugLogging, 1)) {
 		log.debug "$msg"
 	}
 }
